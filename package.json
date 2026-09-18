@@ -1,0 +1,37 @@
+{
+  "name": "chatpop-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "node --env-file-if-exists=.env --import tsx src/server.ts",
+    "dev:lan": "node --env-file-if-exists=.env --import tsx scripts/dev-lan.mjs",
+    "dev:lan:start": "node --env-file-if-exists=.env scripts/dev-lan-service.mjs start",
+    "dev:lan:status": "node --env-file-if-exists=.env scripts/dev-lan-service.mjs status",
+    "dev:lan:stop": "node --env-file-if-exists=.env scripts/dev-lan-service.mjs stop",
+    "build": "tsc -p tsconfig.json",
+    "start": "node --env-file-if-exists=.env dist/server.js",
+    "migrate": "node --env-file-if-exists=.env scripts/migrate.mjs",
+    "test": "node --env-file=.env.test --import tsx --test --test-concurrency=1 tests/*.test.ts",
+    "verify:auth": "node --env-file=.env scripts/verify-auth.mjs",
+    "storage:cleanup": "node --env-file-if-exists=.env dist/cleanup.js"
+  },
+  "devDependencies": {
+    "@types/node": "^26.5.1",
+    "@types/pg": "^8.23.1",
+    "tsx": "^4.23.13",
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "@fastify/cors": "^11.3.0",
+    "@fastify/helmet": "^13.1.1",
+    "argon2": "^0.45.1",
+    "fastify": "^5.12.4",
+    "node-pg-migrate": "^9.0.0",
+    "pg": "^8.23.0",
+    "zod": "^4.6.5"
+  }
+}
