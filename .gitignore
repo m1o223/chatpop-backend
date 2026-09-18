@@ -1,0 +1,32 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+.local/
+coverage/
+*.log
+.DS_Store
+
+# Private credentials, database exports, and temporary artifacts.
+*.key
+*.pem
+*.p12
+*.pfx
+*.p8
+.pgpass
+.npmrc
+credentials*.json
+secrets/
+*.dump
+*.backup
+*.sql.gz
+*.tmp
+*.swp
+*.swo
+*~
+tmp/
+temp/
+# Only the reviewed public CA certificate belongs in Git.
+certs/*
+!certs/supabase-ca.crt
