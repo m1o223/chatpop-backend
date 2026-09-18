@@ -106,6 +106,13 @@ export async function buildApp(config: Config, options: { pool?: pg.Pool; rateLi
     await auth.deleteAccount(request.identity,body.password)
     return reply.code(204).send()
   })
+  app.patch('/me', protectedRoute, async request => {
+    const body = z.object({display_name:z.string().trim().max(80).nullable()}).strict().parse(request.body)
+    const {rows:[user]} = await pool.query(`UPDATE users SET display_name=$1 WHERE id=$2 RETURNING ${safeUserColumns}`,
+      [body.display_name || null, request.identity.userId])
+    if (!user) throw notFound()
+    return {user}
+  })
   app.get('/me/settings', protectedRoute, async request=> {
     const {rows:[settings]} = await pool.query('SELECT * FROM user_settings WHERE user_id=$1',[request.identity.userId])
     if (!settings) throw notFound()
@@ -120,8 +127,10 @@ export async function buildApp(config: Config, options: { pool?: pg.Pool; rateLi
     return {settings}
   })
   app.post('/chats', protectedRoute, async (request,reply)=> {
-    const body = z.object({title:z.string().trim().min(1).max(200).optional()}).strict().parse(request.body ?? {})
-    const {rows:[chat]} = await pool.query('INSERT INTO chats(user_id,title,title_source) VALUES($1,$2,$3) RETURNING *',[request.identity.userId,body.title ?? 'New chat',body.title ? 'user' : 'default'])
+    const body = z.object({id:z.string().uuid().optional(),title:z.string().trim().min(1).max(200).optional()}).strict().parse(request.body ?? {})
+    const {rows:[chat]} = await pool.query(`INSERT INTO chats(id,user_id,title,title_source) VALUES(coalesce($4::uuid,gen_random_uuid()),$1,$2,$3)
+      ON CONFLICT(id) DO UPDATE SET id=chats.id WHERE chats.user_id=$1 RETURNING *`,[request.identity.userId,body.title ?? 'New chat',body.title ? 'user' : 'default',body.id ?? null])
+    if (!chat) throw notFound()
     return reply.code(201).send({chat})
   })
   app.get('/chats', protectedRoute, async request=> {
@@ -150,12 +159,17 @@ export async function buildApp(config: Config, options: { pool?: pg.Pool; rateLi
   })
   app.post('/chats/:id/messages', protectedRoute, async (request,reply)=> {
     const {id}=idParams.parse(request.params)
-    const body=z.object({content:z.string().min(1).max(20000).refine(v=>v.trim().length>0)}).strict().parse(request.body)
+    const body=z.object({id:z.string().uuid().optional(),content:z.string().min(1).max(20000).refine(v=>v.trim().length>0)}).strict().parse(request.body)
     const message=await transaction(pool,async client=> {
       const owned=await client.query('SELECT id FROM chats WHERE id=$1 AND user_id=$2 FOR UPDATE',[id,request.identity.userId])
       if (!owned.rowCount) throw notFound()
-      const {rows:[message]}=await client.query("INSERT INTO messages(chat_id,user_id,role,content) VALUES($1,$2,'user',$3) RETURNING *",[id,request.identity.userId,body.content])
-      await client.query('UPDATE chats SET last_message_at=$1 WHERE id=$2',[message.created_at,id])
+      const {rows:[message]}=await client.query(`INSERT INTO messages(id,chat_id,user_id,role,content) VALUES(coalesce($4::uuid,gen_random_uuid()),$1,$2,'user',$3)
+        ON CONFLICT(id) DO UPDATE SET id=messages.id WHERE messages.chat_id=$1 AND messages.user_id=$2 AND messages.content=$3 AND messages.role='user' RETURNING *`,[id,request.identity.userId,body.content,body.id ?? null])
+      if (!message) throw new ApiError(409,'MESSAGE_CONFLICT','Message could not be saved with this identifier')
+      await client.query(`UPDATE chats SET last_message_at=greatest(last_message_at,$1),
+        title=CASE WHEN title_source='default' THEN $3 ELSE title END,
+        title_source=CASE WHEN title_source='default' THEN 'auto' ELSE title_source END
+        WHERE id=$2`,[message.created_at,id,body.content.trim().replace(/\s+/g,' ').slice(0,80)])
       return message
     })
     return reply.code(201).send({message})
@@ -166,6 +180,19 @@ export async function buildApp(config: Config, options: { pool?: pg.Pool; rateLi
     if (!owned.rowCount) throw notFound()
     const {rows:messages}=await pool.query('SELECT * FROM messages WHERE chat_id=$1 AND user_id=$2 ORDER BY created_at,id LIMIT $3 OFFSET $4',[id,request.identity.userId,query.limit,query.offset])
     return {messages,limit:query.limit,offset:query.offset}
+  })
+  app.get('/media',protectedRoute,async request=> {
+    const query=paging.extend({type:z.enum(['image','video','audio','file']).optional()}).parse(request.query)
+    const {rows:media}=await pool.query(`SELECT ${mediaColumns} FROM media WHERE user_id=$1 AND deleted_at IS NULL
+      AND ($2::text IS NULL OR media_type=$2) ORDER BY created_at DESC,id DESC LIMIT $3 OFFSET $4`,
+      [request.identity.userId,query.type ?? null,query.limit,query.offset])
+    return {media,limit:query.limit,offset:query.offset}
+  })
+  app.delete('/media/:id',protectedRoute,async (request,reply)=> {
+    const {id}=idParams.parse(request.params)
+    const result=await pool.query('DELETE FROM media WHERE id=$1 AND user_id=$2',[id,request.identity.userId])
+    if (!result.rowCount) throw notFound()
+    return reply.code(204).send()
   })
   app.get('/media/:id',protectedRoute,async request=> {
     const {id}=idParams.parse(request.params)
