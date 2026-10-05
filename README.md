@@ -365,3 +365,8 @@ independently security-audited.
 
 References: [OWASP password storage](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html),
 [PostgreSQL source installation](https://www.postgresql.org/docs/18/install-getsource.html).
+# Private Cloud Media
+
+See [CLOUD_MEDIA.md](CLOUD_MEDIA.md) for the staged Supabase Storage adapter,
+environment variable names, private bucket policy, upload protocol, cleanup, and
+the required verification steps before production enablement.

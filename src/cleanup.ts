@@ -5,13 +5,17 @@ import { createPool, transaction } from './db.js'
 import { storageFor } from './storage.js'
 
 export async function cleanStorage(pool: pg.Pool, config: Config, limit = 50) {
+  // Expired reservations and failed uploads are private, never listed as ready.
+  // Row locks held by cloud writes serialize deletion with finalization.
+  await pool.query(`DELETE FROM media WHERE id IN (SELECT id FROM media WHERE status IN ('pending','failed')
+    AND updated_at<now()-interval '1 hour' ORDER BY updated_at FOR UPDATE SKIP LOCKED LIMIT $1)`,[limit])
   let processed = 0
   for (let i=0;i<limit;i++) {
     const found = await transaction(pool, async client => {
       const { rows: [job] } = await client.query(`SELECT * FROM storage_deletions WHERE completed_at IS NULL AND next_attempt_at<=now() ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1`)
       if (!job) return false
       try {
-        await storageFor(config,job.storage_driver).delete(job.storage_key)
+        await storageFor(config,job.storage_driver,job.storage_bucket).delete(job.storage_key)
         await client.query('DELETE FROM storage_deletions WHERE id=$1', [job.id])
       } catch {
         await client.query(`UPDATE storage_deletions SET attempts=attempts+1,next_attempt_at=now()+least(3600,power(2,least(attempts+1,12))) * interval '1 second' WHERE id=$1`, [job.id])

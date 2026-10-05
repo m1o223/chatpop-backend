@@ -1,13 +1,14 @@
 import { before, after, test } from 'node:test'
 import assert from 'node:assert/strict'
-import { randomUUID } from 'node:crypto'
-import { mkdir, writeFile, access, rm } from 'node:fs/promises'
+import { randomUUID, createHash } from 'node:crypto'
+import { mkdir, writeFile, access, rm, readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { runner } from 'node-pg-migrate'
 import { readConfig } from '../src/config.js'
-import { createPool } from '../src/db.js'
+import { createPool, transaction } from '../src/db.js'
 import { buildApp } from '../src/app.js'
 import { cleanStorage } from '../src/cleanup.js'
+import { safeFilename } from '../src/media-upload.js'
 
 const config=readConfig(),url=new URL(config.DATABASE_URL),database=url.pathname.slice(1)
 if(config.NODE_ENV!=='test'||!['localhost','127.0.0.1','[::1]'].includes(url.hostname)||!database.endsWith('_test')||process.env.ALLOW_TEST_DATABASE_RESET!==database) {
@@ -240,4 +241,74 @@ test('database-backed auth rate limiting works and is not bypassed with forwarde
       assert.equal(response.statusCode,i<30?401:429)
     }
   } finally { await limited.close() }
+})
+
+test('private upload protocol enforces content, idempotency, quota and bidirectional isolation',async()=> {
+  const objects=new Map<string,Buffer>()
+  let failPut=false,publicBucket=false
+  const storage={
+    async verifyPrivate(){if(publicBucket)throw new Error('unsafe bucket')},
+    async put(key:string,path:string){if(failPut)throw new Error('provider failure');objects.set(key,await readFile(path))},
+    async sign(key:string){assert.ok(objects.has(key));return 'https://storage.example.test/private?redacted'},
+    async delete(key:string){objects.delete(key)}
+  }
+  const mediaApp=await buildApp({...config,STORAGE_USER_MAX_FILES:3},{pool,rateLimits:false,logger:false,cloudStorage:storage})
+  const call=(method:'GET'|'POST'|'PUT'|'PATCH'|'DELETE',url:string,body:unknown,token?:string)=>mediaApp.inject({method,url,payload:body as never,headers:{...(token?{authorization:`Bearer ${token}`} : {}),...(Buffer.isBuffer(body)?{'content-type':'application/octet-stream','content-length':String(body.length)}:{})}})
+  const a=await account(),b=await account()
+  const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/l9sAAAAASUVORK5CYII=','base64')
+  const description=()=>({upload_key:randomUUID(),mime_type:'image/png',file_size:png.length,sha256:createHash('sha256').update(png).digest('hex'),original_filename:'../safe\u0000.png'})
+  try {
+    assert.equal(safeFilename('../safe\u0000.png'),'..safe.png')
+    assert.equal((await call('POST','/media/uploads',description())).statusCode,401)
+    assert.equal((await call('POST','/media/uploads',{...description(),user_id:b.user.id},a.access_token)).statusCode,400)
+    assert.equal((await call('POST','/media/uploads',{...description(),file_size:104857601},a.access_token)).statusCode,413)
+    for(const [owner,other] of [[a,b],[b,a]]) {
+      const input=description()
+      const reservation=await call('POST','/media/uploads',input,owner.access_token)
+      assert.equal(reservation.statusCode,201)
+      const id=reservation.json().media.id
+      assert.equal(reservation.json().media.status,'pending')
+      assert.equal(reservation.json().media.storage_key,undefined)
+      assert.equal((await call('POST','/media/uploads',input,owner.access_token)).json().media.id,id)
+      assert.equal((await call('GET','/media',undefined,owner.access_token)).json().media.length,0)
+      assert.equal((await call('POST',`/media/${id}/signed-url`,{},owner.access_token)).statusCode,404)
+      assert.equal((await call('PUT',`/media/${id}/content`,png,other.access_token)).statusCode,404)
+      const upload=await call('PUT',`/media/${id}/content`,png,owner.access_token)
+      assert.equal(upload.statusCode,200);assert.equal(upload.json().media.status,'ready')
+      assert.equal((await call('POST',`/media/${id}/signed-url`,{},owner.access_token)).statusCode,200)
+      const {chat}=(await request('POST','/chats',{},owner.access_token)).json()
+      const {message}=(await request('POST',`/chats/${chat.id}/messages`,{content:'Attachment'},owner.access_token)).json()
+      assert.equal((await call('PATCH',`/media/${id}`,{chat_id:chat.id,message_id:message.id},other.access_token)).statusCode,404)
+      const {chat:foreignChat}=(await request('POST','/chats',{},other.access_token)).json()
+      const {message:foreignMessage}=(await request('POST',`/chats/${foreignChat.id}/messages`,{content:'Other account'},other.access_token)).json()
+      assert.equal((await call('PATCH',`/media/${id}`,{chat_id:foreignChat.id,message_id:foreignMessage.id},owner.access_token)).statusCode,404)
+      assert.equal((await call('PATCH',`/media/${id}`,{chat_id:chat.id,message_id:message.id},owner.access_token)).statusCode,200)
+      assert.equal((await call('GET',`/chats/${chat.id}/messages`,undefined,owner.access_token)).json().messages[0].attachments[0].id,id)
+      for(const [method,path] of [['GET',`/media/${id}`],['POST',`/media/${id}/signed-url`],['DELETE',`/media/${id}`]] as const)
+        assert.equal((await call(method,path,method==='POST'?{}:undefined,other.access_token)).statusCode,404)
+      assert.equal((await call('DELETE',`/media/${id}`,undefined,owner.access_token)).statusCode,204)
+      assert.equal((await call('DELETE',`/media/${id}`,undefined,owner.access_token)).statusCode,404)
+      assert.ok((await pool.query('SELECT id FROM storage_deletions WHERE storage_key LIKE $1',[`users/${owner.user.id}/%`])).rowCount)
+    }
+    const fake=Buffer.from('not really an image')
+    const bad={...description(),file_size:fake.length,sha256:createHash('sha256').update(fake).digest('hex')}
+    const id=(await call('POST','/media/uploads',bad,a.access_token)).json().media.id
+    assert.equal((await call('PUT',`/media/${id}/content`,fake,a.access_token)).statusCode,415)
+    assert.equal((await call('GET',`/media/${id}`,undefined,a.access_token)).json().media.status,'failed')
+    failPut=true
+    const second=(await call('POST','/media/uploads',description(),a.access_token)).json().media.id
+    assert.equal((await call('PUT',`/media/${second}/content`,png,a.access_token)).statusCode,500)
+    assert.equal((await call('GET','/media',undefined,a.access_token)).json().media.length,0)
+    assert.equal((await call('POST','/media/uploads',description(),a.access_token)).statusCode,413)
+    publicBucket=true
+    assert.equal((await call('POST','/media/uploads',description(),b.access_token)).statusCode,500)
+    // The normal timestamp trigger prevents direct backdating: disable only this local test trigger within a transaction.
+    await transaction(pool,async client=>{
+      await client.query('ALTER TABLE media DISABLE TRIGGER media_touch')
+      await client.query("UPDATE media SET updated_at=now()-interval '2 hours' WHERE user_id=$1 AND status='failed'",[a.user.id])
+      await client.query('ALTER TABLE media ENABLE TRIGGER media_touch')
+    })
+    await cleanStorage(pool,config)
+    assert.equal((await pool.query("SELECT count(*)::int AS n FROM media WHERE user_id=$1 AND status='failed'",[a.user.id])).rows[0].n,0)
+  } finally {await mediaApp.close()}
 })

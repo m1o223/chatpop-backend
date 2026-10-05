@@ -9,6 +9,9 @@ import { createPool, transaction } from './db.js'
 import { authService, safeUserColumns, type Identity } from './auth.js'
 import { ApiError, notFound } from './errors.js'
 import { safeMime, storageFor } from './storage.js'
+import { registerUploads } from './media-upload.js'
+import { supabaseStorage, type CloudStorage } from './supabase-storage.js'
+import { cleanStorage } from './cleanup.js'
 
 declare module 'fastify' { interface FastifyRequest { identity: Identity } }
 const email = z.string().trim().toLowerCase().email().max(254)
@@ -23,12 +26,13 @@ const settingsSchema = z.object({
   default_ai_model: z.string().trim().min(1).max(100).nullable().optional(),
   language: z.string().regex(/^[a-zA-Z]{2,3}(?:-[a-zA-Z0-9]{2,8})*$/).max(35).optional()
 }).strict().refine(v => Object.keys(v).length>0)
-const mediaColumns = 'id,chat_id,message_id,media_type,mime_type,file_size,width,height,duration,created_at'
+const mediaColumns = 'id,chat_id,message_id,media_type,source_type,original_filename,mime_type,file_size,width,height,duration,status,created_at,updated_at'
 
-export async function buildApp(config: Config, options: { pool?: pg.Pool; rateLimits?: boolean; logger?: boolean } = {}) {
+export async function buildApp(config: Config, options: { pool?: pg.Pool; rateLimits?: boolean; logger?: boolean; cloudStorage?: CloudStorage } = {}) {
+  if (options.cloudStorage && config.NODE_ENV !== 'test') throw new Error('Storage injection is test-only')
   if (options.rateLimits === false && config.NODE_ENV !== 'test') throw new Error('Rate limits may only be disabled in tests')
   const pool = options.pool ?? createPool(config)
-  const app = Fastify({ bodyLimit: 98304, requestTimeout: 15000, connectionTimeout: 10000,
+  const app = Fastify({ bodyLimit: 98304, requestTimeout: 300000, connectionTimeout: 10000,
     trustProxy: config.TRUST_PROXY === 'true', logController: new LogController({disableRequestLogging:true}),
     logger: options.logger === false ? false : { level: 'info', redact: { paths: ['req.headers.authorization','req.body','res.body','password','password_hash','access_token','refresh_token','DATABASE_URL'], censor: '[REDACTED]' } } })
   pool.on('error', () => app.log.error({code:'DB_POOL_ERROR'}, 'Database connection error'))
@@ -40,7 +44,7 @@ export async function buildApp(config: Config, options: { pool?: pg.Pool; rateLi
   await app.register(cors, { origin(origin, done) {
     if (!origin || origins.includes(origin)) done(null,true)
     else done(new ApiError(403,'ORIGIN_DENIED','Origin not allowed'),false)
-  }, methods: ['GET','POST','PATCH','DELETE'], allowedHeaders: ['Content-Type','Authorization'], credentials: false })
+  }, methods: ['GET','POST','PUT','PATCH','DELETE'], allowedHeaders: ['Content-Type','Authorization'], credentials: false })
   async function rate(key: string, max: number, seconds: number) {
     if (options.rateLimits === false) return
     const hash = createHmac('sha256',config.RATE_LIMIT_SECRET).update(key).digest('hex')
@@ -71,6 +75,7 @@ export async function buildApp(config: Config, options: { pool?: pg.Pool; rateLi
   })
   app.setNotFoundHandler((request,reply)=>reply.code(404).send({error:{code:'NOT_FOUND',message:'Resource not found',request_id:request.id}}))
   const protectedRoute = { preHandler: async (request: import('fastify').FastifyRequest) => { request.identity = await auth.authenticate(request.headers.authorization) } }
+  await registerUploads(app,pool,config,protectedRoute.preHandler,rate,options.cloudStorage)
 
   app.get('/health', async()=>({status:'ok'}))
   app.get('/ready', async (request,reply)=> {
@@ -178,21 +183,38 @@ export async function buildApp(config: Config, options: { pool?: pg.Pool; rateLi
     const {id}=idParams.parse(request.params),query=paging.parse(request.query)
     const owned=await pool.query('SELECT id FROM chats WHERE id=$1 AND user_id=$2',[id,request.identity.userId])
     if (!owned.rowCount) throw notFound()
-    const {rows:messages}=await pool.query('SELECT * FROM messages WHERE chat_id=$1 AND user_id=$2 ORDER BY created_at,id LIMIT $3 OFFSET $4',[id,request.identity.userId,query.limit,query.offset])
+    const {rows:messages}=await pool.query(`SELECT m.*,coalesce((SELECT jsonb_agg(jsonb_build_object(
+      'id',a.id,'media_type',a.media_type,'mime_type',a.mime_type,'original_filename',a.original_filename) ORDER BY a.created_at,a.id)
+      FROM media a WHERE a.message_id=m.id AND a.user_id=$2 AND a.status='ready' AND a.deleted_at IS NULL),'[]'::jsonb) AS attachments
+      FROM messages m WHERE m.chat_id=$1 AND m.user_id=$2 ORDER BY m.created_at,m.id LIMIT $3 OFFSET $4`,[id,request.identity.userId,query.limit,query.offset])
     return {messages,limit:query.limit,offset:query.offset}
   })
   app.get('/media',protectedRoute,async request=> {
-    const query=paging.extend({type:z.enum(['image','video','audio','file']).optional()}).parse(request.query)
-    const {rows:media}=await pool.query(`SELECT ${mediaColumns} FROM media WHERE user_id=$1 AND deleted_at IS NULL
-      AND ($2::text IS NULL OR media_type=$2) ORDER BY created_at DESC,id DESC LIMIT $3 OFFSET $4`,
-      [request.identity.userId,query.type ?? null,query.limit,query.offset])
-    return {media,limit:query.limit,offset:query.offset}
+    const query=paging.extend({type:z.enum(['image','video','audio','file']).optional(),chat_id:z.string().uuid().optional(),source_type:z.enum(['uploaded','generated','camera','photo_library','audio_recording','chat_attachment']).optional()}).parse(request.query)
+    const {rows}=await pool.query(`SELECT ${mediaColumns} FROM media WHERE user_id=$1 AND deleted_at IS NULL AND status='ready'
+      AND ($2::text IS NULL OR media_type=$2) AND ($5::uuid IS NULL OR chat_id=$5) AND ($6::text IS NULL OR source_type=$6)
+      ORDER BY created_at DESC,id DESC LIMIT $3 OFFSET $4`,
+      [request.identity.userId,query.type ?? null,query.limit+1,query.offset,query.chat_id??null,query.source_type??null])
+    return {media:rows.slice(0,query.limit),limit:query.limit,offset:query.offset,has_more:rows.length>query.limit}
   })
   app.delete('/media/:id',protectedRoute,async (request,reply)=> {
     const {id}=idParams.parse(request.params)
     const result=await pool.query('DELETE FROM media WHERE id=$1 AND user_id=$2',[id,request.identity.userId])
     if (!result.rowCount) throw notFound()
     return reply.code(204).send()
+  })
+  app.patch('/media/:id',protectedRoute,async request=>{
+    const {id}=idParams.parse(request.params)
+    const body=z.object({chat_id:z.string().uuid(),message_id:z.string().uuid()}).strict().parse(request.body)
+    const media=await transaction(pool,async client=>{
+      const owned=await client.query("SELECT id FROM media WHERE id=$1 AND user_id=$2 AND status='ready' AND deleted_at IS NULL FOR UPDATE",[id,request.identity.userId])
+      if(!owned.rowCount) throw notFound()
+      const message=await client.query('SELECT id FROM messages WHERE id=$1 AND chat_id=$2 AND user_id=$3',[body.message_id,body.chat_id,request.identity.userId])
+      if(!message.rowCount) throw notFound()
+      const {rows:[result]}=await client.query(`UPDATE media SET chat_id=$1,message_id=$2 WHERE id=$3 AND user_id=$4 RETURNING ${mediaColumns}`,[body.chat_id,body.message_id,id,request.identity.userId])
+      return result
+    })
+    return {media}
   })
   app.get('/media/:id',protectedRoute,async request=> {
     const {id}=idParams.parse(request.params)
@@ -204,6 +226,13 @@ export async function buildApp(config: Config, options: { pool?: pg.Pool; rateLi
     const {id}=idParams.parse(request.params)
     const {rows:[media]}=await pool.query('SELECT * FROM media WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL',[id,request.identity.userId])
     if (!media) throw notFound()
+    if (media.status!=='ready') throw new ApiError(409,'MEDIA_NOT_READY','This upload is not ready')
+    if (media.storage_driver==='supabase') {
+      await rate(`media-sign:${request.identity.userId}`,60,60)
+      const storage=supabaseStorage(config,media.storage_bucket)
+      await storage.verifyPrivate()
+      return reply.redirect(await storage.sign(media.storage_key))
+    }
     if (!safeMime[media.media_type]?.includes(media.mime_type) || Number(media.file_size)>config.MAX_MEDIA_BYTES) throw new ApiError(415,'UNSUPPORTED_MEDIA','Media type or size is unsupported')
     const file=await storageFor(config,media.storage_driver).open(media.storage_key)
     try {
@@ -213,6 +242,12 @@ export async function buildApp(config: Config, options: { pool?: pg.Pool; rateLi
       return reply.send(file.createReadStream())
     } catch(error) { await file.close(); throw error }
   })
+  if(config.STORAGE_DRIVER==='supabase' && config.NODE_ENV!=='test') {
+    let running:Promise<unknown>|undefined
+    const sweep=()=>{if(running)return;running=cleanStorage(pool,config,10).catch(()=>app.log.error({code:'STORAGE_CLEANUP_FAILED'},'Cleanup remains queued')).finally(()=>{running=undefined})}
+    const timer=setInterval(sweep,60000);timer.unref()
+    app.addHook('onClose',async()=>{clearInterval(timer);await running})
+  }
   await app.ready()
   return app
 }

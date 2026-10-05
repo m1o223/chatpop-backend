@@ -3,13 +3,18 @@ import { constants } from 'node:fs'
 import { open, unlink, realpath } from 'node:fs/promises'
 import type { Config } from './config.js'
 import { ApiError } from './errors.js'
+import { supabaseStorage } from './supabase-storage.js'
 
 export interface PrivateStorage {
   delete(key: string): Promise<void>
   open(key: string): Promise<import('node:fs/promises').FileHandle>
 }
 // Future S3-compatible adapters belong here; routes never construct vendor URLs.
-export function storageFor(config: Config, driver: string): PrivateStorage {
+export function storageFor(config: Config, driver: string, bucket?: string): PrivateStorage {
+  if (driver === 'supabase') {
+    const cloud=supabaseStorage(config,bucket)
+    return {delete:cloud.delete,async open() { throw new ApiError(409,'SIGNED_ACCESS_REQUIRED','Request private signed access for this media') }}
+  }
   if (driver !== 'local' || config.STORAGE_DRIVER !== 'local') throw new ApiError(503,'STORAGE_UNAVAILABLE','Private storage is not configured')
   const root = resolve(config.STORAGE_LOCAL_ROOT)
   async function path(key: string) {
